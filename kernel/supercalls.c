@@ -31,7 +31,7 @@
 #include "selinux/selinux.h"
 #include "file_wrapper.h"
 
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#ifdef CONFIG_KSU_SUSFS
 bool susfs_is_boot_completed_triggered __read_mostly = false;
 #endif // #ifdef CONFIG_KSU_SUSFS
 
@@ -117,7 +117,7 @@ static int do_report_event(void __user *arg)
 			boot_complete_lock = true;
 			pr_info("boot_complete triggered\n");
 			on_boot_completed();
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#ifdef CONFIG_KSU_SUSFS
 			susfs_is_boot_completed_triggered = true;
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 		}
