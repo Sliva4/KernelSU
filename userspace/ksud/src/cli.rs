@@ -63,10 +63,6 @@ enum Commands {
         /// manager package name
         #[arg(long, default_value_t = String::from(defs::DEFAULT_PACKAGE_NAME))]
         package_name: String,
-
-        /// Trigger soft-reboot after late-load completes
-        #[arg(long)]
-        soft_reboot: bool,
     },
 
     /// Emulate system reboot
@@ -647,7 +643,6 @@ pub fn run() -> Result<()> {
             post_magica,
             kmi,
             package_name,
-            soft_reboot,
         } => {
             if let Some(port) = magica {
                 return crate::magica::run(port, &package_name, allow_shell).map_err(|e| {
@@ -655,17 +650,11 @@ pub fn run() -> Result<()> {
                     e
                 });
             }
-            let result = crate::late_load::run(&package_name, kmi, allow_shell, soft_reboot);
+            let result = crate::late_load::run(&package_name, kmi, allow_shell);
             if post_magica {
                 info!("Restoring adb properties (post-magica cleanup)...");
                 if let Err(e) = crate::magica::disable_adb_root() {
                     error!("disable adb root failed: {e}");
-                }
-            }
-            if soft_reboot && result.is_ok() {
-                info!("Performing soft-reboot...");
-                if utils::create_daemon(false)? {
-                    crate::soft_reboot::soft_reboot()?;
                 }
             }
             result
