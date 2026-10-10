@@ -68,5 +68,4 @@ void on_boot_completed(void)
     pr_info("on_boot_completed!\n");
     track_throne(true);
     ksu_selinux_hide_drop_backup_if_unused();
-    ksu_selinux_hide_on_boot_completed();
 }

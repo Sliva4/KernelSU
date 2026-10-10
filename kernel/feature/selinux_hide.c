@@ -1,7 +1,6 @@
 #include "selinux_hide.h"
 #include "infra/symbol_resolver.h"
 #include "linux/jump_label.h"
-#include "linux/rcupdate.h"
 #include "selinux/sepolicy.h"
 #include <linux/cred.h>
 #include <linux/cpu.h>
@@ -66,10 +65,6 @@ typedef ssize_t (*write_op_fn)(struct file *, char *, size_t);
 
 static write_op_fn *selinux_write_op;
 
-typedef ssize_t (*read_fn)(struct file *filp, char __user *buf, size_t count, loff_t *ppos);
-
-static read_fn *sel_read_sidtab_hash_stats_p;
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
                                                u32 *sid, u32 def_sid, gfp_t gfp_flags);
@@ -96,7 +91,7 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
         return orig_context_write(file, buf, size);
     }
     char *canon = NULL;
-    u32 sid, len;
+    u32 sid, len, tmp;
     ssize_t length;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -106,6 +101,9 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
     length = security_context_to_sid_with_policy(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL);
     if (length) {
         goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(buf, size, &tmp, GFP_KERNEL);
     }
 
     length = security_sid_to_context_with_policy(backup_sepolicy, sid, &canon, &len);
@@ -128,6 +126,9 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
     length = security_context_to_sid(&fake_state, buf, size, &sid, GFP_KERNEL);
     if (length) {
         goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(&selinux_state, buf, size, &tmp, GFP_KERNEL);
     }
 
     length = security_sid_to_context(&fake_state, sid, &canon, &len);
@@ -149,7 +150,7 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
         return orig_access_write(file, buf, size);
     }
     char *scon = NULL, *tcon = NULL;
-    u32 ssid, tsid, sconlen, tconlen;
+    u32 ssid, tsid, sconlen, tconlen, tmp;
     u16 tclass;
     struct av_decision avd;
     ssize_t length;
@@ -184,11 +185,17 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
     length = security_context_to_sid_with_policy(backup_sepolicy, scon, sconlen, &ssid, SECSID_NULL, GFP_KERNEL);
     if (length) {
         goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(scon, sconlen, &tmp, GFP_KERNEL);
     }
 
     length = security_context_to_sid_with_policy(backup_sepolicy, tcon, tconlen, &tsid, SECSID_NULL, GFP_KERNEL);
     if (length) {
         goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(tcon, tconlen, &tmp, GFP_KERNEL);
     }
 
     security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd);
@@ -196,11 +203,17 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
     length = security_context_to_sid(&fake_state, scon, sconlen, &ssid, GFP_KERNEL);
     if (length) {
         goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(&selinux_state, scon, sconlen, &tmp, GFP_KERNEL);
     }
 
     length = security_context_to_sid(&fake_state, tcon, tconlen, &tsid, GFP_KERNEL);
     if (length) {
         goto out;
+    } else {
+        // sync to global sidtab
+        security_context_to_sid(&selinux_state, tcon, tconlen, &tmp, GFP_KERNEL);
     }
 
     security_compute_av_user(&fake_state, ssid, tsid, tclass, &avd);
@@ -214,91 +227,6 @@ out:
     kfree(tcon);
     kfree(scon);
     return length;
-}
-
-// TODO: sync the sidtab when boot completed
-static int my_security_sidtab_hash_stats(char *page)
-{
-    struct selinux_policy *policy = backup_sepolicy;
-    int rc;
-    rcu_read_lock();
-    rc = sidtab_hash_stats(policy->sidtab, page);
-    rcu_read_unlock();
-
-    return rc;
-}
-
-read_fn orig_sel_read_sidtab_hash_stats;
-static ssize_t __nocfi my_sel_read_sidtab_hash_stats(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
-{
-    if (likely(current_uid().val < 10000)) {
-        return orig_sel_read_sidtab_hash_stats(filp, buf, count, ppos);
-    }
-    char *page;
-    ssize_t length;
-
-    page = (char *)__get_free_page(GFP_KERNEL);
-    if (!page)
-        return -ENOMEM;
-
-    length = my_security_sidtab_hash_stats(page);
-    if (length >= 0)
-        length = simple_read_from_buffer(buf, count, ppos, page, length);
-    free_page((unsigned long)page);
-
-    return length;
-}
-
-static void sync_sidtab()
-{
-    struct selinux_policy *policy;
-    struct policydb *policydb;
-    struct sidtab *sidtab;
-    struct sidtab_entry *entry;
-    char *context;
-    u32 hash, sid, len;
-    int rc, success = 0;
-
-    if (!backup_sepolicy)
-        return;
-
-    pr_info("syncing context ...\n");
-
-    rcu_read_lock();
-    policy = rcu_dereference(selinux_state.policy);
-    policydb = &policy->policydb;
-    sidtab = policy->sidtab;
-
-    hash_for_each_rcu (sidtab->context_to_sid, hash, entry, list) {
-        if (entry->context.str)
-            continue;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-        rc = security_sid_to_context_with_policy(policy, entry->sid, &context, &len);
-#else
-        rc = security_sid_to_context(&selinux_state, entry->sid, &context, &len);
-#endif
-        if (rc)
-            continue;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-        rc = security_context_to_sid_with_policy(backup_sepolicy, context, len, &sid, SECSID_NULL, GFP_ATOMIC);
-#else
-        rc = security_context_to_sid(&fake_state, context, len, &sid, GFP_ATOMIC);
-#endif
-        if (!rc) {
-            success++;
-        } else if (rc != -EINVAL) {
-            pr_err("failed to sync %d: %s", entry->sid, context);
-        }
-        kfree(context);
-    }
-    rcu_read_unlock();
-
-    pr_info("sync %d contexts\n", success);
-}
-
-void ksu_selinux_hide_on_boot_completed()
-{
-    sync_sidtab();
 }
 
 static int my_setprocattr(const char *name, void *value, size_t size);
@@ -470,13 +398,6 @@ static int __nocfi sel_hide_setprocattr_tramp(const char *name, void *value, siz
     return ret;
 }
 
-static ssize_t __nocfi sel_hide_sidtab_hash_stats_tramp(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
-{
-    ssize_t ret = my_sel_read_sidtab_hash_stats(filp, buf, count, ppos);
-    sel_hide_guard_exit();
-    return ret;
-}
-
 static int sel_hide_status_open_pre(struct kprobe *p, struct pt_regs *regs)
 {
     if (!sel_hide_guard_enter())
@@ -509,14 +430,6 @@ static int sel_hide_setprocattr_pre(struct kprobe *p, struct pt_regs *regs)
     return 1;
 }
 
-static int sel_hide_sidtab_hash_stats_pre(struct kprobe *p, struct pt_regs *regs)
-{
-    if (!ksu_selinux_hide_enabled || !sel_hide_guard_enter())
-        return 0;
-    instruction_pointer_set(regs, (unsigned long)sel_hide_sidtab_hash_stats_tramp);
-    return 1;
-}
-
 static struct kprobe sel_hide_status_open_kprobe = {
     .pre_handler = sel_hide_status_open_pre,
 };
@@ -528,9 +441,6 @@ static struct kprobe sel_hide_access_write_kprobe = {
 };
 static struct kprobe sel_hide_setprocattr_kprobe = {
     .pre_handler = sel_hide_setprocattr_pre,
-};
-static struct kprobe sel_hide_sidtab_hash_stats_kprobe = {
-    .pre_handler = sel_hide_sidtab_hash_stats_pre,
 };
 
 static int sel_hide_register_probe(struct kprobe *kp, void *target)
@@ -568,13 +478,6 @@ static int ksu_selinux_hide_enable()
         pr_err("selinux_hide: no write_op found!\n");
         return -ENOSYS;
     }
-    // FIXME: this symbol is static
-    struct file_operations *fop = find_kernel_symbol_exact("sel_sidtab_hash_stats_ops");
-    if (!fop) {
-        pr_err("selinux_hide: sel_sidtab_hash_stats_ops not found!\n");
-    } else {
-        sel_read_sidtab_hash_stats_p = &fop->read;
-    }
     hook_selinux_status_open();
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -595,7 +498,6 @@ static int ksu_selinux_hide_enable()
     pr_info("selinux_hide: context_write: 0x%lx [%pSb]\n", (unsigned long)*context_write, *context_write);
     access_write = &selinux_write_op[SEL_ACCESS];
     pr_info("selinux_hide: access_write: 0x%lx [%pSb]\n", (unsigned long)*access_write, *access_write);
-
 #ifdef CONFIG_KSU_RKP_NO_PATCH_TEXT
     orig_context_write = READ_ONCE(*context_write);
     orig_access_write = READ_ONCE(*access_write);
@@ -622,25 +524,9 @@ static int ksu_selinux_hide_enable()
         goto unregister_access;
     }
 
-    if (sel_read_sidtab_hash_stats_p) {
-        orig_sel_read_sidtab_hash_stats = READ_ONCE(*sel_read_sidtab_hash_stats_p);
-        if (!orig_sel_read_sidtab_hash_stats) {
-            pr_warn("selinux_hide: sel_sidtab_hash_stats_ops read is NULL, skipping\n");
-        } else {
-            ret = sel_hide_register_probe(&sel_hide_sidtab_hash_stats_kprobe,
-                                          orig_sel_read_sidtab_hash_stats);
-            if (ret) {
-                pr_err("selinux_hide: register sidtab kprobe err: %d\n", ret);
-                goto unregister_setprocattr;
-            }
-        }
-    }
-
     pr_info("selinux_hide: kprobe hooks registered\n");
     return 0;
 
-unregister_setprocattr:
-    unregister_kprobe(&sel_hide_setprocattr_kprobe);
 unregister_access:
     unregister_kprobe(&sel_hide_access_write_kprobe);
 unregister_context:
@@ -657,8 +543,8 @@ unhook:
         goto unhook_no_patch;
     }
 
-    my = my_write_access;
     orig_access_write = *access_write;
+    my = my_write_access;
     ret = ksu_patch_text(access_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
         pr_err("selinux_hide: init: patch_text access_write err: %d\n", ret);
@@ -669,16 +555,6 @@ unhook:
     if (ret) {
         pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\n", ret);
         goto unhook_no_patch;
-    }
-
-    if (sel_read_sidtab_hash_stats_p) {
-        read_fn my_read = my_sel_read_sidtab_hash_stats;
-        orig_sel_read_sidtab_hash_stats = *sel_read_sidtab_hash_stats_p;
-        ret = ksu_patch_text(sel_read_sidtab_hash_stats_p, &my_read, sizeof(my_read), KSU_PATCH_TEXT_FLUSH_DCACHE);
-        if (ret) {
-            pr_err("selinux_hide: init: patch_text sel_read_sidtab_hash_stats err: %d\n", ret);
-            goto unhook_no_patch;
-        }
     }
 
     return 0;
@@ -711,43 +587,26 @@ static void ksu_selinux_hide_unhook()
         sel_hide_status_open_kprobe.addr = NULL;
         orig_sel_open_handle_status = NULL;
     }
-    if (sel_hide_sidtab_hash_stats_kprobe.addr) {
-        unregister_kprobe(&sel_hide_sidtab_hash_stats_kprobe);
-        sel_hide_sidtab_hash_stats_kprobe.addr = NULL;
-        orig_sel_read_sidtab_hash_stats = NULL;
-    }
 #else
     int ret;
     if (orig_context_write) {
-        ret =
-            ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        ret = ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
         orig_context_write = NULL;
-        if (ret) {
+        if (ret)
             pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
-        }
     }
     if (orig_access_write) {
         ret = ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
         orig_access_write = NULL;
-        if (ret) {
+        if (ret)
             pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
-        }
     }
     if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
         ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
                              sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
         orig_sel_open_handle_status = NULL;
-        if (ret) {
+        if (ret)
             pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\n", ret);
-        }
-    }
-    if (sel_read_sidtab_hash_stats_p && orig_sel_read_sidtab_hash_stats) {
-        ret = ksu_patch_text(sel_read_sidtab_hash_stats_p, &orig_sel_read_sidtab_hash_stats,
-                             sizeof(orig_sel_read_sidtab_hash_stats), KSU_PATCH_TEXT_FLUSH_DCACHE);
-        orig_sel_read_sidtab_hash_stats = NULL;
-        if (ret) {
-            pr_err("selinux_hide: exit: patch_text sel_read_sidtab_hash_stats err: %d\n", ret);
-        }
     }
     ksu_lsm_unhook(&selinux_setprocattr_hook);
 #endif
@@ -996,7 +855,7 @@ static int security_context_to_sid_with_policy(struct selinux_policy *policy, co
     *sid = SECSID_NULL;
 
     // removed: if (force)
-    rcu_read_lock();
+    // removed: rcu lock
     policydb = &policy->policydb;
     sidtab = policy->sidtab;
     rc = string_to_context_struct(policydb, sidtab, scontext2, &context, def_sid);
@@ -1009,7 +868,6 @@ static int security_context_to_sid_with_policy(struct selinux_policy *policy, co
     // removed: if (rc == -ESTALE)
     context_destroy(&context);
 out:
-    rcu_read_unlock();
     kfree(scontext2);
     kfree(str);
     return rc;
